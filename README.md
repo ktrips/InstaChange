@@ -1,4 +1,4 @@
-# Photo Album Example
+# InstaChange Project
 
 Disclaimer: This is not an official Google product.
 
