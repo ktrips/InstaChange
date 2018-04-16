@@ -15,7 +15,7 @@
 # limitations under the License.
 
 
-import os, uuid
+import io, os, uuid
 
 from flask import Flask, render_template, request, redirect, url_for
 from flask_wtf.file import FileField
@@ -28,11 +28,14 @@ import cloudstorage as gcs
 from google.appengine.api import app_identity
 from google.appengine.ext import ndb
 from google.cloud import vision, translate
+#from google.cloud.vision import types
+import random
 
+#client = vision.ImageAnnotatorClient()
 
 app = Flask(__name__)
 
-MAX_PHOTOS = 20
+MAX_PHOTOS = 10
 content_types = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
                  'png': 'image/png', 'gif': 'image/gif'}
 extensions = sorted(content_types.keys())
@@ -42,10 +45,13 @@ storage_path = 'https://storage.cloud.google.com/%s' % bucket_name
 tag_language = os.getenv('LANG_TAG', 'en')
 timestamp_tz = os.getenv('TIMESTAMP_TZ', 'US/Pacific')
 
+tz = timezone(timestamp_tz)
 
 class Tags(ndb.Model):
     timestamp = ndb.DateTimeProperty(auto_now_add=True)
     count = ndb.IntegerProperty(required=True)
+    price = ndb.IntegerProperty(required=False)
+    calorie=ndb.IntegerProperty(required=False)
 
     @classmethod
     def all(cls):
@@ -55,14 +61,27 @@ class Tags(ndb.Model):
 
 class Photo(ndb.Model):
     timestamp = ndb.DateTimeProperty(auto_now_add=True)
-    tags = ndb.StringProperty(repeated=True)
-
+    tags    =ndb.StringProperty(repeated=True)
+    costs   =ndb.IntegerProperty(required=False)
+    calories=ndb.IntegerProperty(required=False)
+    changes =ndb.IntegerProperty(required=False)
+    meals   =ndb.StringProperty(required=False)
+    
+    """local_timestamp = utc.localize(timestamp).astimezone(tz)
+    month = local_timestamp.strftime("%m")
+    
+    @classmethod
+    def month_filter(cls, month):
+        user = ndb.Key('User', 'default')
+        return cls.query(ancestor=user).filter(cls.months == month).order(
+               -cls.timestamp)"""
+               
     @classmethod
     def tag_filter(cls, tag):
         user = ndb.Key('User', 'default')
         return cls.query(ancestor=user).filter(cls.tags == tag).order(
                -cls.timestamp)
-
+               
     @classmethod
     def all(cls):
         user = ndb.Key('User', 'default')
@@ -71,10 +90,13 @@ class Photo(ndb.Model):
 
 @app.template_filter('local_tz')
 def local_tz_filter(timestamp):
-    tz = timezone(timestamp_tz)
     local_timestamp = utc.localize(timestamp).astimezone(tz)
-    return local_timestamp.strftime("%Y/%m/%d %H:%M:%S")
+    return local_timestamp.strftime("%m/%d %H:%M")
 
+@app.template_filter('dates')
+def date_filter(timestamp):
+    date_time = utc.localize(timestamp).astimezone(tz)
+    return date_time.strftime("%d-%b")
 
 def is_image():
     def _is_image(form, field):
@@ -87,10 +109,17 @@ def is_image():
 
 def get_labels(photo_file):
     vision_client = vision.Client()
+    """image = types.Image()
+    image.source.image_uri = 'gs://%s/%s' % (bucket_name, photo_file)
+    res_label= client.label_detection(image=image)
+    res_text = client.text_detection(image=image)
+    labels   = res_label.label_annotations
+    texts    = res_text.text_annotations"""
+
     image = vision_client.image(
                 source_uri = 'gs://%s/%s' % (bucket_name, photo_file))
-    return image.detect_labels(limit=3)
-
+    labels = image.detect_labels(limit=5)
+    return labels
 
 def translate_text(text):
     if tag_language == 'en':
@@ -99,15 +128,27 @@ def translate_text(text):
     result = translate_client.translate(text, target_language=tag_language)
     return result['translatedText']
 
+def is_happy(photo_file):
+    vision_client = vision.Client()
+    image = vision_client.image(
+            source_uri = 'gs://%s/%s' % (bucket_name, photo_file))
+    num_faces, joy_faces = 0, 0
+    for face in image.detect_faces(limit=10):
+        num_faces += 1
+        if face.joy == vision.likelihood.Likelihood.VERY_LIKELY:
+            joy_faces += 1
+    if joy_faces > num_faces * 0.5:
+        return True
+    return False
 
 class PhotoForm(Form):
-    input_photo = FileField(
-        'Photo file (File extension should be: %s)' % ', '.join(extensions),
+    input_photo = FileField('',
+        #'Photo file (File extension should be: %s)' % ', '.join(extensions),
         validators=[is_image()])
 
 
 class TagForm(Form):
-    tag = SelectField('Tag')
+    tag = SelectField('') #'Tag')
 
 
 @app.route('/')
@@ -132,11 +173,9 @@ def photos():
         tag_id = unicode(tag.key.id(), 'utf8')
         choices.append((tag_id, tag_id))
     tag_form.tag.choices = choices
-
     return render_template('photos.html', storage_path=storage_path,
                            photo_form=photo_form, tag_form=tag_form,
                            photos=photos, max_photos=MAX_PHOTOS)
-
 
 @app.route('/delete', methods=['POST'])
 def delete():
@@ -172,20 +211,59 @@ def post():
         gcs_file.close()
 
         labels = get_labels(filename)
-        tags = [translate_text(label.description) for label in labels]
-        entity = Photo(id=filename, tags=tags,
-                       parent=ndb.Key('User', 'default'))
-        entity.put()
+        faces = is_happy(filename)
+        print faces
+        tags = [label.description for label in labels] #[translate_text(label.description) for label in labels]
 
+        calories= 0
+        costs   = 0
         for tag in tags:
             entity = ndb.Key('User', 'default', 'Tags', tag).get()
             if entity:
                 entity.count += 1
             else:
-                entity = Tags(count=1, id=tag,
+                price  = random.randint(4,10)
+                calorie= random.randint(100,300)
+                entity = Tags(count=1, id=tag, price=price, calorie=calorie,
                               parent=ndb.Key('User', 'default'))
             entity.put()
+
+            if entity.price:
+                costs = costs + entity.price
+            if entity.calorie:
+                calories = calories + entity.calorie
+                
+        changes = 0      
+        if costs < 10:
+            changes = 10 - costs
+        elif costs >= 10 and costs < 20:
+            changes = 20 - costs
+        else:
+            changes = 50 - costs
+        
+        """date_time = utc.localize(timestamp).astimezone(tz)
+        hour = int(date_time.strftime("%H"))
+        Bmonth= date_time.strftime("%B")
+        if hour > 7 and hour < 11:
+          meals = "BF"
+        elif itime >= 11 and hour < 15:
+          meals = "lunch"
+        elif itime >= 15 and hour < 17:
+          meals = "snack"
+        elif hour >= 17 and hour <20:
+          meals = "dinner"
+        else:
+          meals = "other"
+        
+        print(meals)"""
+        
+        meals = "lunch"
+
+        entity = Photo(id=filename, tags=tags, costs=costs, calories=calories, changes=changes, meals=meals,
+                      parent=ndb.Key('User', 'default'))
+        entity.put()
+
         return render_template('post.html', storage_path=storage_path,
-                               filename=filename, tags=tags)
+                               filename=filename, tags=tags, costs=costs, calories=calories, changes=changes, meals=meals)
     else:
         return redirect(url_for('photos'))
